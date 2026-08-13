@@ -3,93 +3,82 @@ name: rail
 # ============================================================
 # ORANGE TACO - S7 RAIL - THE RUNNER
 #
-# THREE JOBS, ONE SCHEDULE, IN ORDER. Sequential steps rather than
-# parallel jobs, deliberately: the heartbeat runs last so it reports
-# on a world the earlier steps have already updated.
+# ############ WHY THIS LOOPS ############
+# GITHUB'S CRON FLOOR IS FIVE MINUTES, AND FIVE MINUTES IS TOO COARSE
+# FOR A RUSH. Stock does not drift evenly - it sits perfectly still
+# for sixteen hours and then moves in bursts while the registers are
+# open. A five-minute window during a lunch rush is long enough to
+# sell out an item and keep offering it.
+# The floor applies to the TRIGGER, not to what the job does once it
+# starts. So this fires every five minutes and LOOPS INSIDE, calling
+# stock every STOCK_EVERY seconds until its window is nearly used up.
+# Result: sub-minute stock granularity from a five-minute scheduler.
+#
+# WHAT THE LOOP CANNOT FIX, NAMED: if GitHub is late - and it is
+# best-effort, sometimes by fifteen minutes - the gap between windows
+# is unpolled. Nothing inside a job can cover time the job did not
+# run for. THE WEBHOOK IS THE ANSWER TO THAT, not a shorter interval.
+#
+# ############ THE SWEEP GOES FIRST, DELIBERATELY ############
+# If a late run overlaps the next one, concurrency cancels the older.
+# Whatever gets truncated should be the stock loop, NOT paid orders
+# reaching the kitchen. So the sweep runs first and finishes in a
+# second; the loop then fills the remaining window.
 #
 # ############ NOTHING IS LOGGED BUT A STATUS CODE ############
 # THIS REPOSITORY IS PUBLIC, AND SO ARE ITS RUN LOGS. Our functions
 # answer with guest data - rail-sweep names order numbers, rail-inject
-# returns guest names and ticket names like "Macleod Adegoke - OT-10007".
-# Printing a response here would publish that to the open internet,
-# permanently, in a searchable archive.
+# returns guest and ticket names. Printing a response here would
+# publish that to the open internet, permanently and searchably.
 # So every call uses -o /dev/null and prints ONLY the HTTP status.
 # THE COST IS REAL AND ACCEPTED: when something breaks you get a red X
-# and a number, not an explanation. THE DATABASE IS WHERE YOU LOOK -
-# rail.sync_runs, rail.order_events and rail.receipt_watch carry the
-# detail, privately, and they are the record that matters anyway.
+# and a number. THE DATABASE IS WHERE YOU LOOK - rail.sync_runs,
+# rail.order_events and rail.receipt_watch carry the detail privately.
 # DO NOT ADD RESPONSE LOGGING TO DEBUG SOMETHING. Query the database.
 #
-# ############ FIVE MINUTES IS A FLOOR, NOT A CHOICE ############
-# GitHub's cron minimum is five minutes and its scheduling is
-# best-effort - runs are commonly late under load. That is survivable
-# ONLY because the time-critical paths are event-driven:
-#   - the page calls rail-fire the moment its countdown hits zero, so
-#     the sweep is RECOVERY for closed tabs rather than the route
-#   - the stock webhook (when built) fires on real change, so this
-#     poll is a FLOOR rather than the staleness
-# If either of those is ever removed, this cadence stops being enough.
-#
-# ############ WHERE THE LIVENESS PING ACTUALLY COMES FROM ###########
-# NOT FROM HERE, AND NOT FROM THE HEARTBEAT. rail-stock pings
-# RAIL_HEALTHCHECK_URL itself, and only on FULL SUCCESS - so the ping
-# means "the sync genuinely worked", not "something called something".
-# That is the inverted shape working as ruled.
-# rail-heartbeat is a different mechanism: a POLLABLE status endpoint
-# answering 200 while fresh and 503 once stale. It pings nothing, so
-# calling it from here would be a step that does nothing - which is
-# why there is no heartbeat step below.
-# WHAT THIS LEAVES OPEN, NAMED: stock's ping proves STOCK ran. IT SAYS
-# NOTHING ABOUT THE SWEEP. A dead sweeper would not be caught today.
-# Closing that means the heartbeat gains the ping, checks stock AND
-# sweep freshness, pings only when both are current, and rail-stock's
-# own ping is REMOVED so there is one ping with one meaning rather
-# than two that can disagree. Until then this file is honest about
-# what it does not cover.
+# ############ WHERE THE LIVENESS PINGS COME FROM ############
+# NOT FROM HERE. rail-stock pings its own healthcheck on full success
+# and rail-sweep pings a SEPARATE one, so a dead stock sync and a dead
+# sweeper are distinguishable rather than one combined silence.
+# rail-heartbeat is a different mechanism - a pollable status endpoint
+# that pings nothing - which is why there is no heartbeat step.
 #
 # ############ THE SECRET THIS HOLDS, AND THE ONE IT DOES NOT ########
-# RAIL_CRON_SECRET only. It can trigger syncs and sweeps and NOTHING
+# RAIL_CRON_SECRET only. It triggers syncs and sweeps and NOTHING
 # ELSE - it cannot capture money, void, refund, or send mail.
-# RAIL_INTERNAL_SECRET NEVER LEAVES SUPABASE. rail-sweep holds it
-# server-side and calls rail-inject itself.
+# RAIL_INTERNAL_SECRET NEVER LEAVES SUPABASE.
 #
 # ############ HOW THIS ITSELF STOPS SILENTLY ############
 # GitHub DISABLES SCHEDULED WORKFLOWS in a repository with no commit
 # activity for 60 days. It emails the owner, and it is exactly the
-# failure this whole design exists to catch: the runner stops and
-# everything downstream looks idle rather than broken.
-# The dead-man's-switch is what notices. Do not rely on the email.
+# failure this design exists to catch. Rely on the switch, not the
+# email.
 # ============================================================
 
 on:
   schedule:
     - cron: "*/5 * * * *"
-  workflow_dispatch:        # so it can be triggered by hand from the UI
+  workflow_dispatch:
 
 concurrency:
-  # A late run must not stack on a running one. Ten minutes of backlog
-  # arriving at once is the thundering case the sweeper's own cap also
-  # guards against - this is the outer belt.
+  # A late run must not stack on a running one. Cancelling the older
+  # is safe because the sweep has already finished by then and stock
+  # is idempotent - the next window picks it straight back up.
   group: rail
-  cancel-in-progress: false
+  cancel-in-progress: true
+
+env:
+  STOCK_EVERY: 40        # seconds between stock calls inside the window
+  STOCK_WINDOW: 260      # stop looping after this many seconds
 
 jobs:
   tick:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 6
     steps:
-      - name: stock
-        run: |
-          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 \
-            -X POST "${{ secrets.RAIL_BASE_URL }}rail-stock" \
-            -H "x-rail-cron: ${{ secrets.RAIL_CRON_SECRET }}")
-          echo "stock -> $code"
-          test "$code" = "200"
-
+      # FIRST, and fast. Paid orders reaching the kitchen outranks
+      # everything else in this file.
       - name: sweep
-        # Runs even if stock failed. An order that has been paid for
-        # must reach the kitchen whether or not the menu is current.
-        if: always()
         run: |
           code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 120 \
             -X POST "${{ secrets.RAIL_BASE_URL }}rail-sweep" \
@@ -97,3 +86,27 @@ jobs:
             -H "x-rail-cron: ${{ secrets.RAIL_CRON_SECRET }}")
           echo "sweep -> $code"
           test "$code" = "200"
+
+      - name: stock loop
+        if: always()
+        run: |
+          start=$(date +%s)
+          n=0; good=0
+          while :; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
+              -X POST "${{ secrets.RAIL_BASE_URL }}rail-stock" \
+              -H "x-rail-cron: ${{ secrets.RAIL_CRON_SECRET }}")
+            n=$((n+1))
+            if [ "$code" = "200" ]; then good=$((good+1)); fi
+            echo "stock $n -> $code"
+            now=$(date +%s)
+            elapsed=$((now-start))
+            if [ $((elapsed + STOCK_EVERY)) -ge "$STOCK_WINDOW" ]; then break; fi
+            sleep "$STOCK_EVERY"
+          done
+          echo "stock: $good of $n succeeded"
+          # A single transient failure inside a window is not worth a
+          # red run - the next call is forty seconds away. The step
+          # fails only if EVERY call failed, which means something is
+          # actually wrong rather than briefly unlucky.
+          test "$good" -gt 0
